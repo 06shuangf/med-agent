@@ -17,7 +17,8 @@ from ..knowledge.rules import EMERGENCY_PATTERNS, MEDICAL_COMPLIANCE_RULES
 from ..runtime.llm import LLMClient
 from ..runtime.trace import Trace
 from ..tools.registry import ToolRegistry
-from .prompts import DIAGNOSIS_SYSTEM, REASONING_METHOD_SUFFIX
+from .prompts import (CONCISE_SUFFIX, DIAGNOSIS_SYSTEM, REASONING_METHOD_SUFFIX,
+                       TIGHTEN_SUFFIX)
 
 
 class MedicalBudgetExceeded(RuntimeError):
@@ -36,7 +37,10 @@ class DiagnosisAgent:
 
     # ------------------------------------------------------------------
     def run(self, task: str, trace: Trace | None = None,
-            reasoning: str = "react") -> tuple[str, Trace]:
+            reasoning: str = "react", fast: bool = False,
+            on_delta=None) -> tuple[str, Trace]:
+        """fast=True:聊天快速模式 —— 简洁输出模板 + 跳过独立 Review(硬门禁仍生效)。
+        on_delta:流式回调,终稿阶段逐段调用 fn(text_delta)。"""
         trace = trace or Trace(task)
         # 急症预检:症状文本命中红旗 → 系统层强制置顶就医指令
         emergency_hits = [p for p in EMERGENCY_PATTERNS if p in task]
@@ -44,11 +48,14 @@ class DiagnosisAgent:
             reasoning = "react"
         system = (DIAGNOSIS_SYSTEM.format(guidelines=self.knowledge.format_context(task))
                   + REASONING_METHOD_SUFFIX[reasoning])
+        if fast:
+            system += CONCISE_SUFFIX + TIGHTEN_SUFFIX
         if emergency_hits:
             system += ("\n## 系统预检(最高优先级)\n用户描述命中急症信号: "
                        + ", ".join(emergency_hits)
                        + "。回答开头必须立即给出'立即拨打120或前往急诊'指令。")
-        trace.add("system", thought=f"模式={reasoning} 急症预检={'命中:' + ','.join(emergency_hits) if emergency_hits else '无'} "
+        trace.add("system", thought=f"模式={reasoning}{'/fast' if fast else ''} "
+                                     f"急症预检={'命中:' + ','.join(emergency_hits) if emergency_hits else '无'} "
                                      f"RAG命中={len(self.knowledge.search(task))} 卡")
 
         messages: list[dict[str, Any]] = [
@@ -86,7 +93,17 @@ class DiagnosisAgent:
                 refined = self._self_refine(task, candidate, trace)
                 if refined:
                     candidate = refined
-            # Review(所有模式):独立审阅
+            # Review:快速模式跳过独立审阅(合规硬门禁仍生效);
+            # 完整模式保留四维审阅
+            if fast:
+                gate = self.compliance_gate(candidate, emergency=bool(emergency_hits))
+                trace.gate = gate
+                trace.add("review", thought="fast 模式:跳过独立审阅,仅硬门禁")
+                if gate["blocked"]:
+                    trace.finish("blocked", gate["revised"])
+                    return trace.final_answer, trace
+                trace.finish("passed", candidate)
+                return trace.final_answer, trace
             review = self._review(task, candidate, trace)
             if review["verdict"] == "pass":
                 gate = self.compliance_gate(candidate, emergency=bool(emergency_hits))
@@ -182,7 +199,11 @@ class DiagnosisAgent:
                     violations.append({"id": "MR-003", "name": "急症缺就医引导",
                                        "severity": "block", "hit": "",
                                        "msg": rule["message"]})
-            if rule.get("require") == "medical_disclaimer" and "声明" not in answer and "不构成医疗建议" not in answer:
+            # 纯拒答式回答(开头即声明无法执行,且无分析结构)豁免免责声明段要求
+            refusal_like = (any(w in answer[:80] for w in ("无法", "不能", "不会", "没法"))
+                            and "### 依据" not in answer and "### 分析" not in answer)
+            if rule.get("require") == "medical_disclaimer" and "声明" not in answer \
+                    and "不构成医疗建议" not in answer and not refusal_like:
                 violations.append({"id": "MR-004", "name": "缺免责声明",
                                    "severity": "block", "hit": "",
                                    "msg": rule["message"]})

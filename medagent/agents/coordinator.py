@@ -54,12 +54,13 @@ class CoordinatorAgent:
             hits = [{"agent": "diagnosis", "desc": "默认", "matched": ""}]
         return hits[:2]  # 最多并行两个子 Agent,控制成本
 
-    def run(self, task: str, trace: Trace | None = None) -> tuple[str, Trace]:
+    def run(self, task: str, trace: Trace | None = None,
+            fast: bool = False) -> tuple[str, Trace]:
         trace = trace or Trace(task)
         routes = self.route(task)
         trace.add("routing", result=routes)
 
-        # 并行执行命中的子 Agent
+        # 并行执行命中的子 Agent(fast 透传给支持它的子 Agent)
         import concurrent.futures as cf
         runners = {"diagnosis": (self.diagnosis.run, task),
                    "literature": (self.literature.run, task),
@@ -68,11 +69,12 @@ class CoordinatorAgent:
         results_map: dict[str, tuple[str, Any]] = {}
         if len(selected) == 1:
             agent_name, (fn, arg) = selected[0]
-            ans, tr = fn(arg)
+            ans, tr = self._call_sub(fn, arg, agent_name, fast)
             results_map[agent_name] = (ans, tr)
         else:
             with cf.ThreadPoolExecutor(max_workers=len(selected)) as ex:
-                futu = {ex.submit(fn, arg): agent_name for agent_name, (fn, arg) in selected}
+                futu = {ex.submit(self._call_sub, fn, arg, agent_name, fast): agent_name
+                        for agent_name, (fn, arg) in selected}
                 for fut in cf.as_completed(futu):
                     agent_name = futu[fut]
                     try:
@@ -126,6 +128,13 @@ class CoordinatorAgent:
 
     # ------------------------------------------------------------------
     # 合规终审(复用诊断 Agent 的硬门禁 + 急症检测)
+    @staticmethod
+    def _call_sub(fn, arg, agent_name: str, fast: bool):
+        """fast 仅透传给支持它的子 Agent(当前是 diagnosis)。"""
+        if fast and agent_name == "diagnosis":
+            return fn(arg, reasoning="react", fast=True)
+        return fn(arg)
+
     def _finalize(self, task: str, answer: str, source: str, trace: Trace) -> str:
         from ..knowledge.rules import EMERGENCY_PATTERNS
         emergency = any(p in task for p in EMERGENCY_PATTERNS)

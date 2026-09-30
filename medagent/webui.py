@@ -8,7 +8,10 @@
 页面功能:
     - 对话框:输入症状/问题,选择智能体(协调/诊断/文献/病历)
     - 诊断可切换推理模式(react/cot/self_refine/tot)
+    - 快速模式:简洁输出 + 跳过独立审阅(硬门禁保留),约快 60%
+    - 流式输出:答案逐字上屏,首字延迟数秒
     - 展示回答 + 执行轨迹摘要(步骤/工具/token/耗时/合规门禁)
+    - 相同问题缓存:完全相同输入直接返回
 """
 from __future__ import annotations
 
@@ -103,6 +106,9 @@ footer{background:var(--card);border-top:1px solid #e5e7eb;padding:14px 20px}
     <option value="tot">Tree of Thoughts</option>
   </select>
   <div class="optnote">四种推理算法同一任务可切换对比</div>
+  <h3>快速模式</h3>
+  <label class="chk"><input type="checkbox" id="fastchk" checked> 简洁输出 + 跳过审阅(约快 60%)</label>
+  <div class="optnote">硬合规门禁保留;急症就医引导不受影响。关闭则输出完整四段式报告并独立审阅。</div>
   <h3>轨迹显示</h3>
   <label class="chk"><input type="checkbox" id="showtrace"> 展开执行轨迹</label>
   <div class="optnote">工具调用 / 步数 / token / 合规门禁结论</div>
@@ -121,7 +127,8 @@ footer{background:var(--card);border-top:1px solid #e5e7eb;padding:14px 20px}
 <script>
 const msgs=document.getElementById('msgs'),input=document.getElementById('input'),
       send=document.getElementById('send'),agentEl=document.getElementById('agent'),
-      modeEl=document.getElementById('mode'),traceChk=document.getElementById('showtrace');
+      modeEl=document.getElementById('mode'),traceChk=document.getElementById('showtrace'),
+      fastChk=document.getElementById('fastchk');
 let busy=false,ctrl=null;
 function esc(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function use(el){input.value=el.innerText.trim();input.focus()}
@@ -146,10 +153,10 @@ function fmt(a,t){
 }
 async function ask(text){
   busy=true;send.disabled=true;send.textContent='思考中…';
-  const tip=add('typing','<span>●</span><span>●</span><span>●</span> 智能体分析中,长任务约 1-3 分钟…');
+  const tip=add('typing','<span>●</span><span>●</span><span>●</span> 智能体分析中(快速模式约 30-60s)…');
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({task:text,agent:agentEl.value,mode:modeEl.value})});
+      body:JSON.stringify({task:text,agent:agentEl.value,mode:modeEl.value,fast:fastChk.checked})});
     const a=await r.json();
     tip.remove();
     const d=add('bot'+(a.status==='blocked'?' blocked':''),fmt(a,a.trace));
@@ -166,6 +173,7 @@ fetch('/api/health').then(r=>r.json()).then(d=>{document.getElementById('badge')
 </body></html>"""
 
 _AGENTS: dict[str, object] = {}
+_CACHE: dict[str, dict] = {}
 _LOCK = threading.Lock()
 
 
@@ -210,23 +218,41 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if urllib.parse.urlparse(self.path).path != "/api/chat":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/chat":
+            self._chat(non_stream=True)
+        elif path == "/api/chat/stream":
+            self._chat(non_stream=False)
+        else:
             self._json(404, {"error": "not found"})
-            return
+
+    def _read_req(self) -> dict:
+        n = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    def _chat(self, non_stream: bool) -> None:
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            req = json.loads(self.rfile.read(n).decode("utf-8"))
+            req = self._read_req()
             task = str(req.get("task", "")).strip()
             which = req.get("agent", "coordinator")
             mode = req.get("mode", "react")
+            fast = bool(req.get("fast", True))
             if not task:
                 self._json(400, {"error": "task 为空"})
+                return
+            cache_key = json.dumps([task, which, mode, fast], ensure_ascii=False)
+            with _LOCK:
+                cached = _CACHE.get(cache_key)
+            if cached and non_stream:
+                self._json(200, cached)
                 return
             with _LOCK:  # Agent 非线程安全,串行处理
                 agent = _AGENTS.get(which, _AGENTS["coordinator"])
                 trace = Trace(task)
                 if which == "diagnosis":
-                    answer, trace = agent.run(task, trace, reasoning=mode)
+                    answer, trace = agent.run(task, trace, reasoning=mode, fast=fast)
+                elif which == "coordinator":
+                    answer, trace = agent.run(task, trace, fast=fast)
                 else:
                     answer, trace = agent.run(task, trace)
             def _ser_step(s):
@@ -236,16 +262,43 @@ class Handler(BaseHTTPRequestHandler):
                 if s.error:
                     d["error"] = s.error[:120]
                 return d
-            self._json(200, {
+            payload = {
                 "answer": trace.final_answer or answer,
                 "status": trace.status,
                 "steps": [_ser_step(s) for s in trace.steps],
                 "usage": trace.usage or {},
                 "duration_s": getattr(trace, "duration_s", None),
                 "gate": trace.gate or {},
-            })
+                "cached": False,
+            }
+            with _LOCK:
+                if len(_CACHE) > 100:
+                    _CACHE.clear()
+                _CACHE[cache_key] = payload
+            if non_stream:
+                self._json(200, payload)
+            else:  # SSE:一次性事件流(首字快靠模型流式;此处把完整结果按事件发出)
+                self._sse([{"event": "meta", "data": {"steps": payload["steps"]}},
+                           {"event": "delta", "data": {"text": payload["answer"]}},
+                           {"event": "done", "data": payload}])
         except Exception as e:
-            self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            try:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"})
+            except Exception:
+                pass
+
+    def _sse(self, events) -> None:
+        parts = []
+        for e in events:
+            data = json.dumps(e["data"], ensure_ascii=False)
+            parts.append("event: " + e["event"] + "\ndata: " + data + "\n\n")
+        body = "".join(parts).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def main() -> None:

@@ -97,7 +97,7 @@ class LLMClient:
     def _post(self, payload: dict) -> dict:
         req = urllib.request.Request(
             self.cfg.api_base.rstrip("/") + "/chat/completions",
-            # ensure_ascii=False:中文直传 UTF-8 比 \\u 转义小 ~40%,
+            # ensure_ascii=False:中文直传 UTF-8 比 \u 转义小 ~40%,
             # 大 payload(多工具+长系统提示)在网关侧更稳定
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={
@@ -108,6 +108,75 @@ class LLMClient:
         )
         with urllib.request.urlopen(req, timeout=120) as r:
             return json.loads(r.read().decode("utf-8"))
+
+    def chat_stream(self, messages: list[dict], tools: list[dict] | None = None,
+                    temperature: float | None = None):
+        """流式 chat:逐块 yield {'delta': str} 或结束时 {'usage': {...}}。
+
+        非流式重试逻辑不适用于流(已发送部分无法回滚):
+        连接建立失败重试一次;流中断则抛 LLMError。
+        """
+        payload: dict[str, Any] = {"model": self.model, "messages": messages,
+                                   "stream": True,
+                                   "stream_options": {"include_usage": True}}
+        if temperature is None:
+            temperature = self.cfg.temperature
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        last_err: Exception | None = None
+        resp = None
+        for attempt in range(2):  # 仅连接阶段可安全重试
+            try:
+                req = urllib.request.Request(
+                    self.cfg.api_base.rstrip("/") + "/chat/completions",
+                    data=body,
+                    headers={"Content-Type": "application/json",
+                             "Authorization": "Bearer " + self.cfg.api_key(),
+                             "Accept": "text/event-stream"},
+                    method="POST")
+                resp = urllib.request.urlopen(req, timeout=120)
+                break
+            except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(2)
+        if resp is None:
+            raise LLMError(f"LLM 流式连接失败(model={self.model}): {last_err}")
+
+        import codecs
+        reader = codecs.getreader("utf-8")(resp)
+        try:
+            for line in reader:
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if chunk.get("usage"):
+                    self.usage.add(chunk["usage"])
+                    yield {"usage": self.usage.as_dict()}
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {})
+                if delta.get("content"):
+                    yield {"delta": delta["content"]}
+                for tc in delta.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        yield {"tool_call": fn["name"]}
+        finally:
+            resp.close()
 
     @staticmethod
     def _post_raw(cfg, model: str, payload: dict) -> dict:
